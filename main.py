@@ -22,7 +22,7 @@ from logs import logging
 from bs4 import BeautifulSoup
 import saini as helper
 from utils import progress_bar
-from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS
+from vars import API_ID, API_HASH, BOT_TOKEN, OWNER, CREDIT, AUTH_USERS, TOTAL_USERS, UTK_AUTH_TOKEN, UTK_USER_ID, UTK_BASE_API
 from aiohttp import ClientSession
 from subprocess import getstatusoutput
 from pytube import YouTube
@@ -48,6 +48,21 @@ bot = Client(
     api_hash=API_HASH,
     bot_token=BOT_TOKEN
 )
+
+# ========== Utkarsh API Config ==========
+UTK_HEADERS = {
+    "authorization": f"Bearer {UTK_AUTH_TOKEN}" if UTK_AUTH_TOKEN and not UTK_AUTH_TOKEN.lower().startswith("bearer") else (UTK_AUTH_TOKEN or ""),
+    "x-api-version": "3",
+    "user-id": UTK_USER_ID or "",
+    "content-type": "application/json",
+}
+
+# Per-user cached courses for Utkarsh feature
+ut_user_batch_map = {}
+
+def sanitize_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", (name or "").strip())
+    return safe[:120] if safe else "file"
 
 processing_request = False
 cancel_requested = False
@@ -1692,12 +1707,108 @@ def reset_and_set_commands():
         {"command": "logs", "description": "👁️ View Bot Activity"},
         {"command": "addauth", "description": "▶️ Add Authorisation"},
         {"command": "rmauth", "description": "⏸️ Remove Authorisation "},
-        {"command": "users", "description": "👨‍👨‍👧‍👦 All Premium Users"}
+        {"command": "users", "description": "👨‍👨‍👧‍👦 All Premium Users"},
+        {"command": "utstart", "description": "📚 List Utkarsh batches"},
+        {"command": "utget", "description": "🗂️ Extract batch contents to .txt"}
     ]
     requests.post(url, json={"commands": commands})
     
 
+@bot.on_message(filters.command("utstart") & filters.private)
+async def ut_start_handler(client: Client, message: Message):
+    if not UTK_AUTH_TOKEN or not UTK_USER_ID:
+        await message.reply_text("❗ Utkarsh API is not configured. Set UTK_AUTH_TOKEN and UTK_USER_ID env vars.")
+        return
+    note = await message.reply_text("🔄 Fetching your batches...")
+    try:
+        async with aiohttp.ClientSession(base_url=UTK_BASE_API, headers=UTK_HEADERS) as session:
+            async with session.get("api/course/user-courses", timeout=30) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        courses = payload.get("data", []) if isinstance(payload, dict) else []
+        if not courses:
+            await note.edit_text("⚠️ No batches found.")
+            return
+        user_id = message.from_user.id
+        user_courses = [{"id": str(c.get("id")), "title": c.get("title") or "Untitled"} for c in courses]
+        ut_user_batch_map[user_id] = user_courses
+        lines = ["📚 Available Batches:", ""]
+        for i, c in enumerate(user_courses, 1):
+            lines.append(f"{i}. {c['title']} (ID: {c['id']})")
+        lines += ["", "Use: /utget <index|batch_id> to extract a .txt file."]
+        await note.edit_text("\n".join(lines))
+    except aiohttp.ClientResponseError as e:
+        await note.edit_text(f"❌ API error {e.status}: {e.message}")
+    except aiohttp.ClientError as e:
+        await note.edit_text(f"❌ Network error: {e}")
+    except Exception as e:
+        await note.edit_text(f"❌ Error: {e}")
 
+@bot.on_message(filters.command("utget") & filters.private)
+async def ut_get_handler(client: Client, message: Message):
+    if not UTK_AUTH_TOKEN or not UTK_USER_ID:
+        await message.reply_text("❗ Utkarsh API is not configured. Set UTK_AUTH_TOKEN and UTK_USER_ID env vars.")
+        return
+    user_id = message.from_user.id
+    cached = ut_user_batch_map.get(user_id)
+    if not cached:
+        await message.reply_text("❗ Please run /utstart first to load your batches.")
+        return
+    try:
+        arg = message.command[1]
+    except Exception:
+        await message.reply_text("Usage: /utget <index|batch_id>")
+        return
+    selected_id = None
+    if arg.isdigit():
+        idx = int(arg)
+        if 1 <= idx <= len(cached):
+            selected_id = cached[idx - 1]["id"]
+    if not selected_id:
+        for c in cached:
+            if c["id"] == arg:
+                selected_id = c["id"]
+                break
+    if not selected_id:
+        await message.reply_text("❗ Invalid selection. Provide a valid index or batch ID from the list.")
+        return
+    note = await message.reply_text(f"🔄 Fetching batch {selected_id} content...")
+    try:
+        async with aiohttp.ClientSession(base_url=UTK_BASE_API, headers=UTK_HEADERS) as session:
+            async with session.get(f"api/course/{selected_id}/details", timeout=60) as resp:
+                resp.raise_for_status()
+                payload = await resp.json()
+        course_data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(course_data, dict) or not course_data:
+            course_data = payload if isinstance(payload, dict) else {}
+        course_title = course_data.get("title") or f"batch_{selected_id}"
+        sections = course_data.get("sections", []) or []
+        safe_title = sanitize_filename(course_title)
+        filename = f"{safe_title}_{selected_id}.txt"
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"Course: {course_title}\n{'=' * 40}\n\n")
+            for index, section in enumerate(sections, 1):
+                section_name = section.get("name") or "Untitled Section"
+                f.write(f"[{index:02d}] Section: {section_name}\n")
+                contents = section.get("contents", []) or []
+                for item in contents:
+                    title = item.get("title") or "Untitled"
+                    item_type = (item.get("type") or "").upper()
+                    url = item.get("url") or "N/A"
+                    f.write(f"- Title: {title}\n  Type: {item_type}\n  URL: {url}\n")
+                f.write("\n")
+        await message.reply_document(document=filename, caption=f"✅ Extracted: {course_title}")
+        try:
+            os.remove(filename)
+        except OSError:
+            pass
+        await note.delete()
+    except aiohttp.ClientResponseError as e:
+        await note.edit_text(f"❌ API error {e.status}: {e.message}")
+    except aiohttp.ClientError as e:
+        await note.edit_text(f"❌ Network error: {e}")
+    except Exception as e:
+        await note.edit_text(f"❌ Error extracting batch: {e}")
 
 if __name__ == "__main__":
     reset_and_set_commands()
