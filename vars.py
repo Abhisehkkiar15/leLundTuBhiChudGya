@@ -20,3 +20,9 @@ if int(OWNER) not in AUTH_USERS:
   
 #WEBHOOK = True  # Don't change this
 #PORT = int(os.environ.get("PORT", 8080))  # Default to 8000 if not set
+
+# ========== Utkarsh API Configuration ==========
+UTK_AUTH_TOKEN = environ.get("UTK_AUTH_TOKEN", "")
+UTK_USER_ID = environ.get("UTK_USER_ID", "")
+UTK_BASE_API = environ.get("UTK_BASE_API", "https://utkarshclassapi.classx.co.in/")
+# ==============================================
